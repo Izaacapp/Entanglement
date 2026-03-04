@@ -125,7 +125,7 @@ pub const App = struct {
         try std.posix.tcsetattr(tty, .FLUSH, raw);
 
         const size = try layout.getTermSize(tty);
-        writeOut("\x1b[?1049h\x1b[?25l\x1b[?2004h"); // alt screen + hide cursor + bracketed paste
+        writeOut("\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?1006h"); // alt screen + hide cursor + bracketed paste + mouse
 
         var sess_mgr: ?session.SessionManager = session.SessionManager.init(allocator) catch null;
         var cv = chat.ChatView.init(allocator);
@@ -176,7 +176,7 @@ pub const App = struct {
             sm.deinit();
         }
         if (self.shell) |*sh| sh.deinit();
-        writeOut("\x1b[?2004l\x1b[?25h\x1b[?1049l");
+        writeOut("\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[?1049l");
         std.posix.tcsetattr(self.tty, .FLUSH, self.original_termios) catch {};
         if (self.model_override) |m| self.allocator.free(m);
         if (self.tool_confirm_content) |tc| self.allocator.free(tc);
@@ -309,6 +309,26 @@ pub const App = struct {
         var pos: usize = 0;
         while (pos < input.len) {
             const c = input[pos];
+
+            // SGR mouse: ESC[<button;x;yM or ESC[<button;x;ym
+            if (c == 27 and pos + 2 < input.len and input[pos + 1] == '[' and input[pos + 2] == '<') {
+                // Parse SGR mouse sequence
+                var mpos = pos + 3;
+                // Read button number
+                var button: usize = 0;
+                while (mpos < input.len and input[mpos] >= '0' and input[mpos] <= '9') {
+                    button = button * 10 + (input[mpos] - '0');
+                    mpos += 1;
+                }
+                // Skip rest of sequence until M or m
+                while (mpos < input.len and input[mpos] != 'M' and input[mpos] != 'm') mpos += 1;
+                if (mpos < input.len) mpos += 1;
+
+                if (button == 64) self.chat_view.scrollUp(3); // scroll up
+                if (button == 65) self.chat_view.scrollDown(3); // scroll down
+                pos = mpos;
+                continue;
+            }
 
             // Bracketed paste: ESC[200~ ... ESC[201~
             if (c == 27 and pos + 5 < input.len and
@@ -496,9 +516,24 @@ pub const App = struct {
     }
 
     fn handleStreamingInput(self: *App, input: []const u8) void {
-        // During streaming, allow Page Up/Down/Home/End for scrolling
+        // During streaming, allow scroll keys and mouse
         var pos: usize = 0;
         while (pos < input.len) {
+            // SGR mouse scroll during streaming
+            if (input[pos] == 27 and pos + 2 < input.len and input[pos + 1] == '[' and input[pos + 2] == '<') {
+                var mpos = pos + 3;
+                var button: usize = 0;
+                while (mpos < input.len and input[mpos] >= '0' and input[mpos] <= '9') {
+                    button = button * 10 + (input[mpos] - '0');
+                    mpos += 1;
+                }
+                while (mpos < input.len and input[mpos] != 'M' and input[mpos] != 'm') mpos += 1;
+                if (mpos < input.len) mpos += 1;
+                if (button == 64) self.chat_view.scrollUp(3);
+                if (button == 65) self.chat_view.scrollDown(3);
+                pos = mpos;
+                continue;
+            }
             if (input[pos] == 27 and pos + 2 < input.len and input[pos + 1] == '[') {
                 if (pos + 3 < input.len and input[pos + 3] == '~') {
                     if (input[pos + 2] == '5') { // Page Up
@@ -998,6 +1033,8 @@ pub const App = struct {
             try self.showGitDiff();
         } else if (std.mem.startsWith(u8, msg, "/run ")) {
             try self.runShellCommand(msg[5..]);
+        } else if (std.mem.eql(u8, msg, "/status")) {
+            try self.showStatus();
         } else {
             self.chat_view.addSystemMessage("Unknown command. Try /help") catch {};
         }
@@ -1103,6 +1140,34 @@ pub const App = struct {
         var status_buf: [64]u8 = undefined;
         const status_msg = std.fmt.bufPrint(&status_buf, "Exported to {s}", .{path}) catch "Exported!";
         self.status_bar.setStatus(status_msg);
+    }
+
+    fn showStatus(self: *App) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const w = buf.writer(self.allocator);
+
+        try w.writeAll("sniper v0.5.2\n");
+        try w.print("model: {s}\n", .{self.cfg.model});
+        try w.print("endpoint: {s}\n", .{self.cfg.endpoint});
+        try w.print("messages: {d}\n", .{self.chat_view.messages.items.len});
+        try w.print("tokens: in={d} out={d}\n", .{ self.chat_view.total_prompt_tokens, self.chat_view.total_completion_tokens });
+
+        const ctx_pct = if (self.status_bar.context_limit > 0)
+            (self.chat_view.total_prompt_tokens * 100) / self.status_bar.context_limit
+        else
+            0;
+        try w.print("context: {d}% of {d}\n", .{ ctx_pct, self.status_bar.context_limit });
+        try w.print("tools: {s}\n", .{if (self.tools_supported) "enabled" else "disabled"});
+        try w.print("shell: {s}\n", .{if (self.shell != null) "persistent" else "none"});
+        try w.print("theme: {s}\n", .{theme.currentName()});
+        try w.print("history: {d} entries\n", .{self.history.items.len});
+
+        if (self.session_mgr) |sm| {
+            try w.print("session: {s}\n", .{sm.current_id orelse "unsaved"});
+        }
+
+        try self.chat_view.addSystemMessage(buf.items);
     }
 
     fn runShellCommand(self: *App, cmd: []const u8) !void {
@@ -1494,7 +1559,7 @@ pub const App = struct {
         tmp_file.close();
 
         // Restore terminal
-        writeOut("\x1b[?2004l\x1b[?25h\x1b[?1049l");
+        writeOut("\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[?1049l");
         std.posix.tcsetattr(self.tty, .FLUSH, self.original_termios) catch {};
 
         // Spawn editor
@@ -1547,7 +1612,7 @@ pub const App = struct {
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 0;
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 1;
         std.posix.tcsetattr(self.tty, .FLUSH, raw) catch {};
-        writeOut("\x1b[?1049h\x1b[?25l\x1b[?2004h");
+        writeOut("\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?1006h");
     }
 
     fn renderToolConfirm(self: *App, writer: anytype, t: theme.Theme) !void {
