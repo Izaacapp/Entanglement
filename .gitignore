@@ -11,3 +11,4 @@ zig-out/
 # OS
 .DS_Store
 resources/
+tools/

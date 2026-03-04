@@ -151,23 +151,20 @@ pub const ChatView = struct {
             return;
         }
 
-        var lines: std.ArrayList([]const u8) = .empty;
-        defer lines.deinit(self.allocator);
+        // Use arena allocator for all per-frame temp allocations
+        // Everything is freed at once when the arena is deinited — no per-object free overhead
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const frame_alloc = arena.allocator();
 
-        var temp_strings: std.ArrayList([]u8) = .empty;
-        defer {
-            for (temp_strings.items) |s| self.allocator.free(s);
-            temp_strings.deinit(self.allocator);
-        }
+        var lines: std.ArrayList([]const u8) = .empty;
+        defer lines.deinit(frame_alloc);
 
         // Build virtual message list: real messages + streaming in-progress
         const stream_msg = if (self.streaming_active and self.stream_buf.items.len > 0)
             Message{ .role = .assistant, .content = self.stream_buf.items }
         else
             null;
-
-        const msg_count = self.messages.items.len + @as(usize, if (stream_msg != null) 1 else 0);
-        _ = msg_count;
 
         for (self.messages.items, 0..) |*msg, msg_idx| {
             // Skip tool-call-only assistant messages (no visible content)
@@ -179,7 +176,7 @@ pub const ChatView = struct {
                 // Use cached render lines (separated by \x00)
                 var cache_iter = std.mem.splitScalar(u8, msg.cached_render.?, 0);
                 while (cache_iter.next()) |cached_line| {
-                    try lines.append(self.allocator, cached_line);
+                    try lines.append(frame_alloc, cached_line);
                 }
                 continue;
             }
@@ -201,27 +198,22 @@ pub const ChatView = struct {
             };
 
             const label_line = if (is_selected)
-                try std.fmt.allocPrint(self.allocator, "\x1b[7m\x1b[{s}m {s} \x1b[0m \xe2\x86\x90 copy", .{ label_style, name })
+                try std.fmt.allocPrint(frame_alloc, "\x1b[7m\x1b[{s}m {s} \x1b[0m \xe2\x86\x90 copy", .{ label_style, name })
             else
-                try std.fmt.allocPrint(self.allocator, "\x1b[{s}m {s} \x1b[0m", .{ label_style, name });
-            try temp_strings.append(self.allocator, label_line);
-            try lines.append(self.allocator, label_line);
+                try std.fmt.allocPrint(frame_alloc, "\x1b[{s}m {s} \x1b[0m", .{ label_style, name });
+            try lines.append(frame_alloc, label_line);
 
             var content = msg.content;
-            var stripped: ?[]const u8 = null;
-            var rendered: ?[]const u8 = null;
             if (msg.role == .assistant) {
-                stripped = markdown.stripThinkBlocks(self.allocator, msg.content) catch null;
+                const stripped = markdown.stripThinkBlocks(frame_alloc, msg.content) catch null;
                 const base = if (stripped) |s| s else msg.content;
-                rendered = markdown.renderMarkdown(self.allocator, base) catch null;
+                const rendered = markdown.renderMarkdown(frame_alloc, base) catch null;
                 if (rendered) |r| {
                     content = r;
                 } else if (stripped) |s| {
                     content = s;
                 }
             }
-            defer if (stripped) |s| self.allocator.free(s);
-            defer if (rendered) |r| self.allocator.free(r);
 
             // For tool results, truncate long output at a line boundary
             if (msg.role == .tool and content.len > 2000) {
@@ -229,12 +221,10 @@ pub const ChatView = struct {
                 var cut_at: usize = 2000;
                 while (cut_at > 0 and content[cut_at - 1] != '\n') cut_at -= 1;
                 if (cut_at == 0) cut_at = 2000; // no newlines, just cut
-                const truncated = try std.fmt.allocPrint(self.allocator, "{s}\n\x1b[2m... ({d} bytes truncated)\x1b[0m", .{
+                content = try std.fmt.allocPrint(frame_alloc, "{s}\n\x1b[2m... ({d} bytes truncated)\x1b[0m", .{
                     content[0..cut_at],
                     content.len - cut_at,
                 });
-                try temp_strings.append(self.allocator, truncated);
-                content = truncated;
             }
 
             const wrap_width = @as(usize, width) -| 4;
@@ -253,13 +243,12 @@ pub const ChatView = struct {
                 if (content[i] == '\n') {
                     const text = content[line_start..i];
                     const formatted = if (is_tool and text.len > 0 and text[0] == '+')
-                        try std.fmt.allocPrint(self.allocator, "  \x1b[32m{s}\x1b[0m", .{text})
+                        try std.fmt.allocPrint(frame_alloc, "  \x1b[32m{s}\x1b[0m", .{text})
                     else if (is_tool and text.len > 0 and text[0] == '-')
-                        try std.fmt.allocPrint(self.allocator, "  \x1b[31m{s}\x1b[0m", .{text})
+                        try std.fmt.allocPrint(frame_alloc, "  \x1b[31m{s}\x1b[0m", .{text})
                     else
-                        try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ line_prefix, text, line_suffix });
-                    try temp_strings.append(self.allocator, formatted);
-                    try lines.append(self.allocator, formatted);
+                        try std.fmt.allocPrint(frame_alloc, "{s}{s}{s}", .{ line_prefix, text, line_suffix });
+                    try lines.append(frame_alloc, formatted);
                     i += 1;
                     line_start = i;
                     col = 0;
@@ -287,9 +276,8 @@ pub const ChatView = struct {
                             break_at = last_space_i + 1; // break after the space
                         }
                         const text = content[line_start..break_at];
-                        const formatted = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ line_prefix, text, line_suffix });
-                        try temp_strings.append(self.allocator, formatted);
-                        try lines.append(self.allocator, formatted);
+                        const formatted = try std.fmt.allocPrint(frame_alloc, "{s}{s}{s}", .{ line_prefix, text, line_suffix });
+                        try lines.append(frame_alloc, formatted);
                         line_start = break_at;
                         // Recount columns from new line_start to current i
                         col = 0;
@@ -314,18 +302,18 @@ pub const ChatView = struct {
             if (line_start < content.len) {
                 const text = content[line_start..];
                 const formatted = if (is_tool and text.len > 0 and text[0] == '+')
-                    try std.fmt.allocPrint(self.allocator, "  \x1b[32m{s}\x1b[0m", .{text})
+                    try std.fmt.allocPrint(frame_alloc, "  \x1b[32m{s}\x1b[0m", .{text})
                 else if (is_tool and text.len > 0 and text[0] == '-')
-                    try std.fmt.allocPrint(self.allocator, "  \x1b[31m{s}\x1b[0m", .{text})
+                    try std.fmt.allocPrint(frame_alloc, "  \x1b[31m{s}\x1b[0m", .{text})
                 else
-                    try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ line_prefix, text, line_suffix });
-                try temp_strings.append(self.allocator, formatted);
-                try lines.append(self.allocator, formatted);
+                    try std.fmt.allocPrint(frame_alloc, "{s}{s}{s}", .{ line_prefix, text, line_suffix });
+                try lines.append(frame_alloc, formatted);
             }
 
-            try lines.append(self.allocator, "");
+            try lines.append(frame_alloc, "");
 
             // Cache the rendered lines for this message (not when selected)
+            // Uses self.allocator since cache persists across frames
             if (!is_selected) {
                 const new_lines = lines.items[lines_before..];
                 var cache_buf: std.ArrayList(u8) = .empty;
@@ -342,23 +330,18 @@ pub const ChatView = struct {
 
         // Render streaming in-progress message
         if (stream_msg) |smsg| {
-            const label_line = try std.fmt.allocPrint(self.allocator, "\x1b[{s}m sniper \x1b[0m", .{t.assistant_label});
-            try temp_strings.append(self.allocator, label_line);
-            try lines.append(self.allocator, label_line);
+            const label_line = try std.fmt.allocPrint(frame_alloc, "\x1b[{s}m sniper \x1b[0m", .{t.assistant_label});
+            try lines.append(frame_alloc, label_line);
 
             var content = smsg.content;
-            var stripped_s: ?[]const u8 = null;
-            var rendered_s: ?[]const u8 = null;
-            stripped_s = markdown.stripThinkBlocks(self.allocator, smsg.content) catch null;
+            const stripped_s = markdown.stripThinkBlocks(frame_alloc, smsg.content) catch null;
             const base_s = if (stripped_s) |s| s else smsg.content;
-            rendered_s = markdown.renderMarkdown(self.allocator, base_s) catch null;
+            const rendered_s = markdown.renderMarkdown(frame_alloc, base_s) catch null;
             if (rendered_s) |r| {
                 content = r;
             } else if (stripped_s) |s| {
                 content = s;
             }
-            defer if (stripped_s) |s| self.allocator.free(s);
-            defer if (rendered_s) |r| self.allocator.free(r);
 
             const wrap_width_s = @as(usize, width) -| 4;
             if (wrap_width_s > 0) {
@@ -370,9 +353,8 @@ pub const ChatView = struct {
                 while (si < content.len) {
                     if (content[si] == '\n') {
                         const text = content[line_start_s..si];
-                        const formatted = try std.fmt.allocPrint(self.allocator, "  {s}", .{text});
-                        try temp_strings.append(self.allocator, formatted);
-                        try lines.append(self.allocator, formatted);
+                        const formatted = try std.fmt.allocPrint(frame_alloc, "  {s}", .{text});
+                        try lines.append(frame_alloc, formatted);
                         si += 1;
                         line_start_s = si;
                         col_s = 0;
@@ -399,9 +381,8 @@ pub const ChatView = struct {
                                 break_at = last_sp_i + 1;
                             }
                             const text = content[line_start_s..break_at];
-                            const formatted = try std.fmt.allocPrint(self.allocator, "  {s}", .{text});
-                            try temp_strings.append(self.allocator, formatted);
-                            try lines.append(self.allocator, formatted);
+                            const formatted = try std.fmt.allocPrint(frame_alloc, "  {s}", .{text});
+                            try lines.append(frame_alloc, formatted);
                             line_start_s = break_at;
                             col_s = 0;
                             var ri = line_start_s;
@@ -424,13 +405,12 @@ pub const ChatView = struct {
                 }
                 if (line_start_s < content.len) {
                     const text = content[line_start_s..];
-                    const formatted = try std.fmt.allocPrint(self.allocator, "  {s}", .{text});
-                    try temp_strings.append(self.allocator, formatted);
-                    try lines.append(self.allocator, formatted);
+                    const formatted = try std.fmt.allocPrint(frame_alloc, "  {s}", .{text});
+                    try lines.append(frame_alloc, formatted);
                 }
             }
 
-            try lines.append(self.allocator, "");
+            try lines.append(frame_alloc, "");
         }
 
         const total = lines.items.len;
