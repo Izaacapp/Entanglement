@@ -20,6 +20,6 @@ pub fn renderHLine(writer: anytype, width: u16, color: []const u8) !void {
     while (i < width) : (i += 1) {
         try writer.writeAll("─");
     }
-    try writer.writeAll("\x1b[0m\r\n");
+    try writer.writeAll("\x1b[0m\x1b[K\r\n");
 }
 

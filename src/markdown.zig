@@ -46,24 +46,27 @@ pub fn renderMarkdown(allocator: std.mem.Allocator, input: []const u8) ![]const 
         if (std.mem.startsWith(u8, std.mem.trimLeft(u8, line, " "), "```")) {
             if (in_code_block) {
                 try w.writeAll("\x1b[0m"); // end code block
+                try w.writeAll("\x1b[2m\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\x1b[0m"); // └───
                 in_code_block = false;
             } else {
                 in_code_block = true;
-                // Show language tag if present
+                // Show language tag with border
                 const trimmed = std.mem.trimLeft(u8, line, " ");
                 const lang = trimmed[3..];
+                try w.writeAll("\x1b[2m\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"); // ┌───
                 if (lang.len > 0) {
-                    try w.writeAll("\x1b[2m");
+                    try w.writeByte(' ');
                     try w.writeAll(lang);
-                    try w.writeAll("\x1b[0m");
+                    try w.writeByte(' ');
                 }
+                try w.writeAll("\x1b[0m");
                 try w.writeAll("\x1b[2m"); // dim for code
             }
             continue;
         }
 
         if (in_code_block) {
-            try w.writeAll("  ");
+            try w.writeAll("\xe2\x94\x82 "); // │ (with space)
             // Basic syntax highlighting for common tokens
             try highlightCodeLine(w, line);
             continue;
@@ -131,6 +134,20 @@ pub fn renderMarkdown(allocator: std.mem.Allocator, input: []const u8) ![]const 
 
             try w.writeByte(line[i]);
             i += 1;
+        }
+
+        // Reset inline styles at end of each line to prevent leaking
+        if (in_inline_code) {
+            try w.writeAll("\x1b[0m");
+            in_inline_code = false;
+        }
+        if (in_bold) {
+            try w.writeAll("\x1b[22m");
+            in_bold = false;
+        }
+        if (in_italic) {
+            try w.writeAll("\x1b[23m");
+            in_italic = false;
         }
     }
 

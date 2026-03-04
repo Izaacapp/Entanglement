@@ -88,7 +88,7 @@ pub const App = struct {
         try std.posix.tcsetattr(tty, .FLUSH, raw);
 
         const size = try layout.getTermSize(tty);
-        writeOut("\x1b[?1049h\x1b[?25l");
+        writeOut("\x1b[?1049h\x1b[?25l\x1b[?2004h"); // alt screen + hide cursor + bracketed paste
 
         var sess_mgr: ?session.SessionManager = session.SessionManager.init(allocator) catch null;
         var cv = chat.ChatView.init(allocator);
@@ -127,7 +127,7 @@ pub const App = struct {
             sm.deinit();
         }
         if (self.shell) |*sh| sh.deinit();
-        writeOut("\x1b[?25h\x1b[?1049l");
+        writeOut("\x1b[?2004l\x1b[?25h\x1b[?1049l");
         std.posix.tcsetattr(self.tty, .FLUSH, self.original_termios) catch {};
         if (self.model_override) |m| self.allocator.free(m);
         if (self.tool_confirm_content) |tc| self.allocator.free(tc);
@@ -185,7 +185,7 @@ pub const App = struct {
         const w = buf.writer(self.allocator);
         const t = theme.current();
 
-        try w.writeAll("\x1b[H\x1b[J");
+        try w.writeAll("\x1b[H"); // cursor home (no full clear — each line clears to end)
 
         const editor_height = self.editor_view.getHeight();
         const chrome_height: u16 = editor_height + 2;
@@ -194,6 +194,13 @@ pub const App = struct {
         try self.chat_view.render(w, self.width, chat_height, t, self.selected_message);
         try layout.renderHLine(w, self.width, t.border);
         try self.editor_view.render(w, self.width, editor_height, t);
+
+        // Update scroll indicator
+        if (self.chat_view.scroll_offset > 0) {
+            self.status_bar.scroll_indicator = "\xe2\x86\x91 scrolled";
+        } else {
+            self.status_bar.scroll_indicator = null;
+        }
         try self.status_bar.render(w, self.width, t);
 
         switch (self.mode) {
@@ -212,13 +219,16 @@ pub const App = struct {
     }
 
     fn handleInput(self: *App) !void {
-        var buf: [32]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         const n = std.posix.read(self.tty, &buf) catch return;
         if (n == 0) return;
         const input = buf[0..n];
 
-        // During streaming, input is handled by poll() in streamChat
-        if (self.streaming) return;
+        // During streaming, only allow scroll keys
+        if (self.streaming) {
+            self.handleStreamingInput(input);
+            return;
+        }
 
         if (self.mode != .normal) {
             try self.handleDialogInput(input);
@@ -229,6 +239,39 @@ pub const App = struct {
         var pos: usize = 0;
         while (pos < input.len) {
             const c = input[pos];
+
+            // Bracketed paste: ESC[200~ ... ESC[201~
+            if (c == 27 and pos + 5 < input.len and
+                input[pos + 1] == '[' and input[pos + 2] == '2' and
+                input[pos + 3] == '0' and input[pos + 4] == '0' and input[pos + 5] == '~')
+            {
+                pos += 6; // skip paste start marker
+                // Find paste end marker ESC[201~
+                const paste_start = pos;
+                while (pos + 5 < input.len) {
+                    if (input[pos] == 27 and input[pos + 1] == '[' and input[pos + 2] == '2' and
+                        input[pos + 3] == '0' and input[pos + 4] == '1' and input[pos + 5] == '~')
+                    {
+                        break;
+                    }
+                    pos += 1;
+                }
+                const paste_end = pos;
+                if (pos + 5 < input.len) pos += 6; // skip paste end marker
+
+                // Insert pasted content into editor (newlines become actual newlines)
+                const pasted = input[paste_start..paste_end];
+                for (pasted) |pc| {
+                    if (pc == '\r') continue; // skip CR from CRLF
+                    if (pc == '\n') {
+                        self.editor_view.insertNewline() catch {};
+                    } else if (pc >= 32) {
+                        self.editor_view.buffer.insert(self.allocator, self.editor_view.cursor, pc) catch break;
+                        self.editor_view.cursor += 1;
+                    }
+                }
+                continue;
+            }
 
             // Escape sequence
             if (c == 27 and pos + 1 < input.len) {
@@ -241,15 +284,25 @@ pub const App = struct {
 
                 // ESC [ sequences
                 if (input[pos + 1] == '[' and pos + 2 < input.len) {
-                    // Page Up/Down: ESC[5~ / ESC[6~
+                    // Page Up/Down: ESC[5~ / ESC[6~, Home/End: ESC[1~ / ESC[4~
                     if (pos + 3 < input.len and input[pos + 3] == '~') {
-                        if (input[pos + 2] == '5') {
+                        if (input[pos + 2] == '5') { // Page Up
                             self.chat_view.scrollUp(self.height / 2);
                             pos += 4;
                             continue;
                         }
-                        if (input[pos + 2] == '6') {
+                        if (input[pos + 2] == '6') { // Page Down
                             self.chat_view.scrollDown(self.height / 2);
+                            pos += 4;
+                            continue;
+                        }
+                        if (input[pos + 2] == '1') { // Home — scroll to top
+                            self.chat_view.scroll_offset = std.math.maxInt(usize);
+                            pos += 4;
+                            continue;
+                        }
+                        if (input[pos + 2] == '4') { // End — scroll to bottom
+                            self.chat_view.scrollToBottom();
                             pos += 4;
                             continue;
                         }
@@ -317,6 +370,40 @@ pub const App = struct {
         }
     }
 
+    fn handleStreamingInput(self: *App, input: []const u8) void {
+        // During streaming, allow Page Up/Down/Home/End for scrolling
+        var pos: usize = 0;
+        while (pos < input.len) {
+            if (input[pos] == 27 and pos + 2 < input.len and input[pos + 1] == '[') {
+                if (pos + 3 < input.len and input[pos + 3] == '~') {
+                    if (input[pos + 2] == '5') { // Page Up
+                        self.chat_view.scrollUp(self.height / 2);
+                        pos += 4;
+                        continue;
+                    }
+                    if (input[pos + 2] == '6') { // Page Down
+                        self.chat_view.scrollDown(self.height / 2);
+                        pos += 4;
+                        continue;
+                    }
+                    if (input[pos + 2] == '1') { // Home
+                        self.chat_view.scroll_offset = std.math.maxInt(usize);
+                        pos += 4;
+                        continue;
+                    }
+                    if (input[pos + 2] == '4') { // End
+                        self.chat_view.scrollToBottom();
+                        pos += 4;
+                        continue;
+                    }
+                }
+                pos += 3;
+                continue;
+            }
+            pos += 1;
+        }
+    }
+
     fn handleControlChar(self: *App, c: u8) !void {
         switch (c) {
             3 => { // Ctrl+C
@@ -331,6 +418,7 @@ pub const App = struct {
                 self.status_bar.setStatus(theme.currentName());
             },
             0x1F => self.mode = .help, // Ctrl+?
+            0x0C => {}, // Ctrl+L — force redraw (just re-renders next frame)
             0x0E => try self.newSession(), // Ctrl+N
             0x0F => try self.openModelSelect(), // Ctrl+O
             0x13 => try self.openSessionList(), // Ctrl+S
@@ -436,7 +524,7 @@ pub const App = struct {
         var use_tools = self.tools_supported;
 
         while (iterations < max_iterations) : (iterations += 1) {
-            self.status_bar.setStatus(if (iterations == 0) "Thinking..." else "Using tools...");
+            self.status_bar.setLoading(if (iterations == 0) "Thinking..." else "Using tools...");
             try self.render();
 
             self.chat_view.beginAssistantStream();
@@ -466,7 +554,9 @@ pub const App = struct {
                         return;
                     }
                     if (retry < max_retries) {
-                        self.status_bar.setStatus("Retrying...");
+                        var retry_msg_buf: [32]u8 = undefined;
+                        const retry_msg = std.fmt.bufPrint(&retry_msg_buf, "Retry {d}/{d}...", .{ retry + 1, max_retries }) catch "Retrying...";
+                        self.status_bar.setLoading(retry_msg);
                         try self.render();
                         std.Thread.sleep(backoff_ms[retry] * std.time.ns_per_ms);
                         self.chat_view.beginAssistantStream(); // Reset stream buf
@@ -565,7 +655,7 @@ pub const App = struct {
 
             // Execute each tool (with permission check for write tools)
             for (tcs) |tc| {
-                self.status_bar.setStatus(tc.function_name);
+                self.status_bar.setLoading(tc.function_name);
                 try self.render();
 
                 // Permission check for write tools
@@ -750,7 +840,7 @@ pub const App = struct {
             return;
         }
 
-        self.status_bar.setStatus("Compacting...");
+        self.status_bar.setLoading("Compacting...");
         try self.render();
 
         // Build a summary prompt
@@ -1060,7 +1150,7 @@ pub const App = struct {
         tmp_file.close();
 
         // Restore terminal
-        writeOut("\x1b[?25h\x1b[?1049l");
+        writeOut("\x1b[?2004l\x1b[?25h\x1b[?1049l");
         std.posix.tcsetattr(self.tty, .FLUSH, self.original_termios) catch {};
 
         // Spawn editor
@@ -1113,7 +1203,7 @@ pub const App = struct {
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 0;
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 1;
         std.posix.tcsetattr(self.tty, .FLUSH, raw) catch {};
-        writeOut("\x1b[?1049h\x1b[?25l");
+        writeOut("\x1b[?1049h\x1b[?25l\x1b[?2004h");
     }
 
     fn renderToolConfirm(self: *App, writer: anytype, t: theme.Theme) !void {

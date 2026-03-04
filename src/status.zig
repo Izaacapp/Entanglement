@@ -2,12 +2,17 @@ const std = @import("std");
 const config = @import("config.zig");
 const theme = @import("theme.zig");
 
+const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
 pub const StatusBar = struct {
     cfg: config.Config,
     message: []const u8,
     prompt_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     context_limit: u32 = 32768,
+    is_loading: bool = false,
+    spinner_tick: usize = 0,
+    scroll_indicator: ?[]const u8 = null, // e.g. "↑ 23 lines"
 
     pub fn init(cfg: config.Config) StatusBar {
         return .{
@@ -18,6 +23,12 @@ pub const StatusBar = struct {
 
     pub fn setStatus(self: *StatusBar, msg: []const u8) void {
         self.message = msg;
+        self.is_loading = false;
+    }
+
+    pub fn setLoading(self: *StatusBar, msg: []const u8) void {
+        self.message = msg;
+        self.is_loading = true;
     }
 
     pub fn updateTokens(self: *StatusBar, prompt: u32, completion: u32) void {
@@ -41,15 +52,26 @@ pub const StatusBar = struct {
                 (self.prompt_tokens * 100) / self.context_limit
             else
                 0;
-            const tok_str = std.fmt.bufPrint(&tok_buf, " | {d}+{d}tok | ctx:{d}%", .{ self.prompt_tokens, self.completion_tokens, ctx_pct }) catch "";
+            const tok_str = std.fmt.bufPrint(&tok_buf, " | in:{d} out:{d} | ctx:{d}%", .{ self.prompt_tokens, self.completion_tokens, ctx_pct }) catch "";
             try writer.writeAll(tok_str);
             left_len += tok_str.len;
         }
 
-        // Right: status message
+        // Scroll indicator
+        if (self.scroll_indicator) |scroll_info| {
+            var scroll_buf: [48]u8 = undefined;
+            const scroll_str = std.fmt.bufPrint(&scroll_buf, " | {s}", .{scroll_info}) catch "";
+            try writer.writeAll(scroll_str);
+            left_len += scroll_str.len;
+        }
+
+        // Right: spinner + status message
         const w: usize = @intCast(width);
-        const right_start = if (w > left_len + self.message.len + 2)
-            w - self.message.len - 2
+        const spinner_str = if (self.is_loading) spinner_frames[self.spinner_tick % spinner_frames.len] else "";
+        const spinner_len: usize = if (self.is_loading) 2 else 0; // spinner char + space
+        const right_content_len = spinner_len + self.message.len + 1;
+        const right_start = if (w > left_len + right_content_len + 1)
+            w - right_content_len
         else
             left_len + 2;
 
@@ -57,7 +79,12 @@ pub const StatusBar = struct {
         while (i < right_start) : (i += 1) {
             try writer.writeByte(' ');
         }
+        if (self.is_loading) {
+            self.spinner_tick +%= 1;
+            try writer.writeAll(spinner_str);
+            try writer.writeByte(' ');
+        }
         try writer.print("{s} ", .{self.message});
-        try writer.writeAll("\x1b[0m");
+        try writer.writeAll("\x1b[K\x1b[0m");
     }
 };

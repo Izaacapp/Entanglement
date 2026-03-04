@@ -87,7 +87,8 @@ pub const ChatView = struct {
     pub fn appendAssistantChunk(self: *ChatView, chunk: []const u8) !void {
         if (self.streaming_active) {
             try self.stream_buf.appendSlice(self.allocator, chunk);
-            self.scrollToBottom();
+            // Only auto-scroll if user is already at bottom
+            if (self.scroll_offset == 0) self.scrollToBottom();
             return;
         }
         // Fallback for non-streaming mode
@@ -133,10 +134,20 @@ pub const ChatView = struct {
 
     pub fn render(self: *ChatView, writer: anytype, width: u16, height: u16, t: theme.Theme, selected_msg: ?usize) !void {
         if (self.messages.items.len == 0 and !self.streaming_active) {
-            try writer.writeAll("\r\n");
-            try writer.print("\x1b[{s}m  sniper \x1b[0m v0.3.0\r\n", .{t.assistant_label});
-            try writer.writeAll("  Type a message and press Enter.\r\n");
-            try writer.writeAll("  Ctrl+? for help.\r\n\r\n");
+            try writer.writeAll("\x1b[K\r\n");
+            try writer.print("\x1b[{s}m  sniper \x1b[0m \x1b[2mv0.4.0\x1b[0m\x1b[K\r\n", .{t.assistant_label});
+            try writer.writeAll("\x1b[K\r\n");
+            try writer.writeAll("  \x1b[2mType a message and press Enter to send.\x1b[0m\x1b[K\r\n");
+            try writer.writeAll("  \x1b[2mUse @file to reference files, Ctrl+F to attach.\x1b[0m\x1b[K\r\n");
+            try writer.writeAll("  \x1b[2mCtrl+? for help, /help for commands.\x1b[0m\x1b[K\r\n");
+            try writer.writeAll("\x1b[K\r\n");
+            // Fill remaining lines
+            const used: usize = 7;
+            const h: usize = @intCast(height);
+            var rem = if (h > used) h - used else 0;
+            while (rem > 0) : (rem -= 1) {
+                try writer.writeAll("\x1b[K\r\n");
+            }
             return;
         }
 
@@ -212,11 +223,15 @@ pub const ChatView = struct {
             defer if (stripped) |s| self.allocator.free(s);
             defer if (rendered) |r| self.allocator.free(r);
 
-            // For tool results, truncate long output
+            // For tool results, truncate long output at a line boundary
             if (msg.role == .tool and content.len > 2000) {
-                const truncated = try std.fmt.allocPrint(self.allocator, "{s}\n... ({d} bytes truncated)", .{
-                    content[0..2000],
-                    content.len - 2000,
+                // Find last newline before 2000 to avoid breaking mid-line or mid-UTF-8
+                var cut_at: usize = 2000;
+                while (cut_at > 0 and content[cut_at - 1] != '\n') cut_at -= 1;
+                if (cut_at == 0) cut_at = 2000; // no newlines, just cut
+                const truncated = try std.fmt.allocPrint(self.allocator, "{s}\n\x1b[2m... ({d} bytes truncated)\x1b[0m", .{
+                    content[0..cut_at],
+                    content.len - cut_at,
                 });
                 try temp_strings.append(self.allocator, truncated);
                 content = truncated;
@@ -228,7 +243,12 @@ pub const ChatView = struct {
             var line_start: usize = 0;
             var col: usize = 0;
             var i: usize = 0;
+            var last_space_i: usize = 0;
+            var last_space_col: usize = 0;
             const is_tool = msg.role == .tool;
+            const is_system = msg.role == .system;
+            const line_prefix: []const u8 = if (is_system) "  \x1b[2m" else "  ";
+            const line_suffix: []const u8 = if (is_system) "\x1b[0m" else "";
             while (i < content.len) {
                 if (content[i] == '\n') {
                     const text = content[line_start..i];
@@ -237,12 +257,14 @@ pub const ChatView = struct {
                     else if (is_tool and text.len > 0 and text[0] == '-')
                         try std.fmt.allocPrint(self.allocator, "  \x1b[31m{s}\x1b[0m", .{text})
                     else
-                        try std.fmt.allocPrint(self.allocator, "  {s}", .{text});
+                        try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ line_prefix, text, line_suffix });
                     try temp_strings.append(self.allocator, formatted);
                     try lines.append(self.allocator, formatted);
                     i += 1;
                     line_start = i;
                     col = 0;
+                    last_space_i = i;
+                    last_space_col = 0;
                 } else if (content[i] == '\x1b' and i + 1 < content.len and content[i + 1] == '[') {
                     // ANSI escape sequence — skip without counting columns
                     i += 2;
@@ -252,15 +274,40 @@ pub const ChatView = struct {
                     // UTF-8 continuation byte — don't count column
                     i += 1;
                 } else {
+                    if (content[i] == ' ') {
+                        last_space_i = i;
+                        last_space_col = col;
+                    }
                     col += 1;
                     i += 1;
                     if (col >= wrap_width) {
-                        const text = content[line_start..i];
-                        const formatted = try std.fmt.allocPrint(self.allocator, "  {s}", .{text});
+                        // Try to break at last space (word boundary)
+                        var break_at = i;
+                        if (last_space_i > line_start and last_space_col > 0) {
+                            break_at = last_space_i + 1; // break after the space
+                        }
+                        const text = content[line_start..break_at];
+                        const formatted = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ line_prefix, text, line_suffix });
                         try temp_strings.append(self.allocator, formatted);
                         try lines.append(self.allocator, formatted);
-                        line_start = i;
+                        line_start = break_at;
+                        // Recount columns from new line_start to current i
                         col = 0;
+                        var ri = line_start;
+                        while (ri < i) {
+                            if (content[ri] == '\x1b' and ri + 1 < content.len and content[ri + 1] == '[') {
+                                ri += 2;
+                                while (ri < content.len and !isAnsiTerminator(content[ri])) ri += 1;
+                                if (ri < content.len) ri += 1;
+                            } else if (content[ri] & 0xC0 == 0x80) {
+                                ri += 1;
+                            } else {
+                                col += 1;
+                                ri += 1;
+                            }
+                        }
+                        last_space_i = line_start;
+                        last_space_col = 0;
                     }
                 }
             }
@@ -271,7 +318,7 @@ pub const ChatView = struct {
                 else if (is_tool and text.len > 0 and text[0] == '-')
                     try std.fmt.allocPrint(self.allocator, "  \x1b[31m{s}\x1b[0m", .{text})
                 else
-                    try std.fmt.allocPrint(self.allocator, "  {s}", .{text});
+                    try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ line_prefix, text, line_suffix });
                 try temp_strings.append(self.allocator, formatted);
                 try lines.append(self.allocator, formatted);
             }
@@ -318,6 +365,8 @@ pub const ChatView = struct {
                 var line_start_s: usize = 0;
                 var col_s: usize = 0;
                 var si: usize = 0;
+                var last_sp_i: usize = 0;
+                var last_sp_col: usize = 0;
                 while (si < content.len) {
                     if (content[si] == '\n') {
                         const text = content[line_start_s..si];
@@ -327,16 +376,49 @@ pub const ChatView = struct {
                         si += 1;
                         line_start_s = si;
                         col_s = 0;
+                        last_sp_i = si;
+                        last_sp_col = 0;
+                    } else if (content[si] == '\x1b' and si + 1 < content.len and content[si + 1] == '[') {
+                        // ANSI escape — skip without counting columns
+                        si += 2;
+                        while (si < content.len and !isAnsiTerminator(content[si])) si += 1;
+                        if (si < content.len) si += 1;
+                    } else if (content[si] & 0xC0 == 0x80) {
+                        // UTF-8 continuation byte
+                        si += 1;
                     } else {
+                        if (content[si] == ' ') {
+                            last_sp_i = si;
+                            last_sp_col = col_s;
+                        }
                         col_s += 1;
                         si += 1;
                         if (col_s >= wrap_width_s) {
-                            const text = content[line_start_s..si];
+                            var break_at = si;
+                            if (last_sp_i > line_start_s and last_sp_col > 0) {
+                                break_at = last_sp_i + 1;
+                            }
+                            const text = content[line_start_s..break_at];
                             const formatted = try std.fmt.allocPrint(self.allocator, "  {s}", .{text});
                             try temp_strings.append(self.allocator, formatted);
                             try lines.append(self.allocator, formatted);
-                            line_start_s = si;
+                            line_start_s = break_at;
                             col_s = 0;
+                            var ri = line_start_s;
+                            while (ri < si) {
+                                if (content[ri] == '\x1b' and ri + 1 < content.len and content[ri + 1] == '[') {
+                                    ri += 2;
+                                    while (ri < content.len and !isAnsiTerminator(content[ri])) ri += 1;
+                                    if (ri < content.len) ri += 1;
+                                } else if (content[ri] & 0xC0 == 0x80) {
+                                    ri += 1;
+                                } else {
+                                    col_s += 1;
+                                    ri += 1;
+                                }
+                            }
+                            last_sp_i = line_start_s;
+                            last_sp_col = 0;
                         }
                     }
                 }
@@ -367,12 +449,12 @@ pub const ChatView = struct {
 
         for (lines.items[start..end]) |line| {
             try writer.writeAll(line);
-            try writer.writeAll("\r\n");
+            try writer.writeAll("\x1b[K\r\n"); // clear to end of line
         }
 
         var remaining = h - (end - start);
         while (remaining > 0) : (remaining -= 1) {
-            try writer.writeAll("\r\n");
+            try writer.writeAll("\x1b[K\r\n"); // clear empty lines
         }
     }
 };

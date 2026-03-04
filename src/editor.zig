@@ -13,6 +13,7 @@ pub const Editor = struct {
     allocator: std.mem.Allocator,
     buffer: std.ArrayList(u8) = .empty,
     cursor: usize = 0,
+    scroll_offset: usize = 0, // first visible line in editor viewport
 
     pub fn init(allocator: std.mem.Allocator) Editor {
         return .{ .allocator = allocator };
@@ -247,53 +248,73 @@ pub const Editor = struct {
     }
 
     pub fn render(self: *Editor, writer: anytype, width: u16, height: u16, t: theme.Theme) !void {
-        _ = height;
         const max_visible = @as(usize, width) -| 4;
         if (max_visible == 0) return;
+        const max_lines: usize = @intCast(height);
 
-        // Split buffer by newlines
+        // Find which line the cursor is on
+        const cursor_info = self.getCursorLineCol();
+
+        // Adjust scroll_offset to keep cursor visible
+        if (cursor_info.line < self.scroll_offset) {
+            self.scroll_offset = cursor_info.line;
+        } else if (cursor_info.line >= self.scroll_offset + max_lines) {
+            self.scroll_offset = cursor_info.line - max_lines + 1;
+        }
+
+        // Split buffer by newlines and render visible lines
         var line_idx: usize = 0;
+        var lines_rendered: usize = 0;
         var pos: usize = 0;
         while (pos <= self.buffer.items.len) {
             // Find end of this line
             var end = pos;
             while (end < self.buffer.items.len and self.buffer.items[end] != '\n') end += 1;
 
-            const line_content = self.buffer.items[pos..end];
-            const prefix = if (line_idx == 0) " > " else "   ";
-            try writer.print("\x1b[{s}m{s}\x1b[0m", .{ t.prompt_style, prefix });
+            if (line_idx >= self.scroll_offset and lines_rendered < max_lines) {
+                const line_content = self.buffer.items[pos..end];
+                const prefix = if (line_idx == 0) " > " else "   ";
+                try writer.print("\x1b[{s}m{s}\x1b[0m", .{ t.prompt_style, prefix });
 
-            // Show visible portion with cursor
-            const start_offset = if (line_content.len > max_visible) line_content.len - max_visible else 0;
-            const cursor_in_line = self.cursor >= pos and self.cursor <= end;
-            const cursor_col = if (cursor_in_line) self.cursor - pos else 0;
+                // Show visible portion with cursor
+                const start_offset = if (line_content.len > max_visible) line_content.len - max_visible else 0;
+                const cursor_in_line = self.cursor >= pos and self.cursor <= end;
+                const cursor_col = if (cursor_in_line) self.cursor - pos else 0;
 
-            if (cursor_in_line) {
-                const visible = line_content[start_offset..];
-                const cursor_vis = if (cursor_col >= start_offset) cursor_col - start_offset else 0;
+                if (cursor_in_line) {
+                    const visible = line_content[start_offset..];
+                    const cursor_vis = if (cursor_col >= start_offset) cursor_col - start_offset else 0;
 
-                if (cursor_vis < visible.len) {
-                    // Cursor is on a character
-                    try writer.writeAll(visible[0..cursor_vis]);
-                    try writer.writeAll("\x1b[7m"); // reverse video
-                    try writer.writeByte(visible[cursor_vis]);
-                    try writer.writeAll("\x1b[0m"); // reset
-                    try writer.writeAll(visible[cursor_vis + 1 ..]);
+                    if (cursor_vis < visible.len) {
+                        // Cursor on a character — highlight full UTF-8 sequence
+                        try writer.writeAll(visible[0..cursor_vis]);
+                        try writer.writeAll("\x1b[7m");
+                        const clen = utf8ByteLen(visible[cursor_vis]);
+                        const cend = @min(cursor_vis + clen, visible.len);
+                        try writer.writeAll(visible[cursor_vis..cend]);
+                        try writer.writeAll("\x1b[0m");
+                        try writer.writeAll(visible[cend..]);
+                    } else {
+                        // Cursor at end of line — show block cursor as space
+                        try writer.writeAll(visible);
+                        try writer.writeAll("\x1b[7m \x1b[0m");
+                    }
                 } else {
-                    // Cursor at end of line — show block cursor as space
-                    try writer.writeAll(visible);
-                    try writer.writeAll("\x1b[7m \x1b[0m");
+                    try writer.writeAll(line_content[start_offset..]);
                 }
-            } else {
-                try writer.writeAll(line_content[start_offset..]);
-            }
 
-            try writer.writeAll("\x1b[K\r\n");
+                try writer.writeAll("\x1b[K\r\n");
+                lines_rendered += 1;
+            }
 
             line_idx += 1;
             if (end >= self.buffer.items.len) break;
             pos = end + 1; // skip newline
         }
 
+        // Fill remaining lines if editor area is larger than content
+        while (lines_rendered < max_lines) : (lines_rendered += 1) {
+            try writer.writeAll("\x1b[K\r\n");
+        }
     }
 };
