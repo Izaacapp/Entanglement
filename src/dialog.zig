@@ -140,6 +140,8 @@ pub fn renderHelp(writer: anytype, term_width: u16, term_height: u16, t: theme.T
         "Ctrl+O       Select model",
         "Ctrl+F       Attach file",
         "Ctrl+Y       Copy last response",
+        "Ctrl+R       Search messages",
+        "Up/Down      Input history",
         "Page Up      Scroll up",
         "Page Down    Scroll down",
         "Home         Scroll to top",

@@ -54,7 +54,7 @@ pub const Editor = struct {
     }
 
     // Get line/col info for multi-line navigation
-    fn getCursorLineCol(self: *Editor) struct { line: usize, col: usize, line_start: usize } {
+    pub fn getCursorLineCol(self: *Editor) struct { line: usize, col: usize, line_start: usize } {
         var line: usize = 0;
         var line_start: usize = 0;
         for (self.buffer.items[0..self.cursor], 0..) |c, i| {
@@ -66,7 +66,7 @@ pub const Editor = struct {
         return .{ .line = line, .col = self.cursor - line_start, .line_start = line_start };
     }
 
-    fn getLineCount(self: *Editor) usize {
+    pub fn getLineCount(self: *Editor) usize {
         var count: usize = 1;
         for (self.buffer.items) |c| {
             if (c == '\n') count += 1;

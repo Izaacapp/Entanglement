@@ -23,6 +23,7 @@ pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     session_dir: []const u8,
     current_id: ?[]const u8 = null,
+    current_title: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) !SessionManager {
         const home = std.posix.getenv("HOME") orelse return error.NoHome;
@@ -54,11 +55,14 @@ pub const SessionManager = struct {
 
     pub fn deinit(self: *SessionManager) void {
         if (self.current_id) |id| self.allocator.free(id);
+        if (self.current_title) |t| self.allocator.free(t);
         self.allocator.free(self.session_dir);
     }
 
     pub fn newSession(self: *SessionManager) !void {
         if (self.current_id) |id| self.allocator.free(id);
+        if (self.current_title) |t| self.allocator.free(t);
+        self.current_title = null;
         // Generate timestamp-based ID
         const ts = std.time.timestamp();
         const epoch_secs: u64 = @intCast(ts);
@@ -76,12 +80,14 @@ pub const SessionManager = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.json", .{ self.session_dir, id });
         defer self.allocator.free(path);
 
-        // Build title from first user message
-        var title: []const u8 = "untitled";
-        for (chat_view.messages.items) |msg| {
-            if (msg.role == .user) {
-                title = if (msg.content.len > 50) msg.content[0..50] else msg.content;
-                break;
+        // Use generated title, or fall back to first user message
+        var title: []const u8 = self.current_title orelse "untitled";
+        if (self.current_title == null) {
+            for (chat_view.messages.items) |msg| {
+                if (msg.role == .user) {
+                    title = if (msg.content.len > 50) msg.content[0..50] else msg.content;
+                    break;
+                }
             }
         }
 

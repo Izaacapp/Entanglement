@@ -17,6 +17,34 @@ fn writeOut(data: []const u8) void {
     stdout.writeAll(data) catch {};
 }
 
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var match = true;
+        for (needle, 0..) |nc, j| {
+            const hc = haystack[i + j];
+            const lower_h = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
+            const lower_n = if (nc >= 'A' and nc <= 'Z') nc + 32 else nc;
+            if (lower_h != lower_n) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+fn countContentLines(content: []const u8) usize {
+    if (content.len == 0) return 1;
+    var count: usize = 1;
+    for (content) |c| {
+        if (c == '\n') count += 1;
+    }
+    return count;
+}
+
 fn utf8CharLen(first_byte: u8) usize {
     if (first_byte < 0x80) return 1;
     if (first_byte & 0xE0 == 0xC0) return 2;
@@ -34,6 +62,7 @@ const UiMode = enum {
     file_picker,
     copy_select,
     tool_confirm,
+    search,
 };
 
 pub const App = struct {
@@ -62,6 +91,14 @@ pub const App = struct {
     shell: ?tools_mod.PersistentShell = null,
     // File attachments
     attachments: std.ArrayList([]const u8) = .empty,
+    // Persistent render buffer (reused every frame)
+    render_buf: std.ArrayList(u8) = .empty,
+    // Input history
+    history: std.ArrayList([]const u8) = .empty,
+    history_pos: ?usize = null, // null = editing new input, 0..n = browsing history
+    history_draft: std.ArrayList(u8) = .empty, // saves current input when browsing
+    // Search state
+    search_query: std.ArrayList(u8) = .empty,
     // Context loaded
     context_loaded: bool = false,
 
@@ -110,10 +147,22 @@ pub const App = struct {
             .running = true,
             .original_termios = original,
             .attachments = std.ArrayList([]const u8).empty,
+            .render_buf = std.ArrayList(u8).empty,
+            .history = std.ArrayList([]const u8).empty,
+            .history_draft = std.ArrayList(u8).empty,
+            .search_query = std.ArrayList(u8).empty,
         };
+
+        // Set context limit from config
+        app.status_bar.context_limit = cfg.context_limit;
 
         // Initialize persistent shell
         app.shell = tools_mod.PersistentShell.init(allocator) catch null;
+
+        // Load system prompt from config
+        if (cfg.system_prompt) |sp| {
+            app.chat_view.addSystemMessage(sp) catch {};
+        }
 
         // Load context files
         app.loadContextFiles();
@@ -134,6 +183,11 @@ pub const App = struct {
         self.freeDialogItems();
         self.freeAttachments();
         self.attachments.deinit(self.allocator);
+        self.render_buf.deinit(self.allocator);
+        for (self.history.items) |h| self.allocator.free(h);
+        self.history.deinit(self.allocator);
+        self.history_draft.deinit(self.allocator);
+        self.search_query.deinit(self.allocator);
         self.chat_view.deinit();
         self.editor_view.deinit();
     }
@@ -180,9 +234,8 @@ pub const App = struct {
             self.height = size.rows;
         } else |_| {}
 
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
+        self.render_buf.clearRetainingCapacity();
+        const w = self.render_buf.writer(self.allocator);
         const t = theme.current();
 
         try w.writeAll("\x1b[H"); // cursor home (no full clear — each line clears to end)
@@ -212,10 +265,11 @@ pub const App = struct {
                     try dv.render(w, self.width, self.height, t);
                 }
             },
+            .search => try self.renderSearchBar(w, t),
             .copy_select, .normal => {},
         }
 
-        stdout.writeAll(buf.items) catch {};
+        stdout.writeAll(self.render_buf.items) catch {};
     }
 
     fn handleInput(self: *App) !void {
@@ -308,6 +362,25 @@ pub const App = struct {
                         }
                     }
 
+                    // Up/Down arrow: history navigation when on first/last line
+                    if (input[pos + 2] == 'A') { // Up arrow
+                        const info = self.editor_view.getCursorLineCol();
+                        if (info.line == 0) {
+                            self.historyUp();
+                            pos += 3;
+                            continue;
+                        }
+                    }
+                    if (input[pos + 2] == 'B') { // Down arrow
+                        const info = self.editor_view.getCursorLineCol();
+                        const total_lines = self.editor_view.getLineCount();
+                        if (info.line + 1 >= total_lines) {
+                            self.historyDown();
+                            pos += 3;
+                            continue;
+                        }
+                    }
+
                     // Pass escape sequence to editor
                     const seq_end = @min(pos + 4, input.len);
                     try self.editor_view.handleInput(input[pos..seq_end]);
@@ -367,6 +440,42 @@ pub const App = struct {
 
             // Skip unexpected bytes
             pos += 1;
+        }
+    }
+
+    fn historyUp(self: *App) void {
+        if (self.history.items.len == 0) return;
+        if (self.history_pos == null) {
+            // Save current input as draft
+            self.history_draft.clearRetainingCapacity();
+            self.history_draft.appendSlice(self.allocator, self.editor_view.buffer.items) catch {};
+            self.history_pos = self.history.items.len - 1;
+        } else if (self.history_pos.? > 0) {
+            self.history_pos.? -= 1;
+        } else {
+            return; // already at oldest
+        }
+        // Load history entry into editor
+        const entry = self.history.items[self.history_pos.?];
+        self.editor_view.buffer.clearRetainingCapacity();
+        self.editor_view.buffer.appendSlice(self.allocator, entry) catch {};
+        self.editor_view.cursor = self.editor_view.buffer.items.len;
+    }
+
+    fn historyDown(self: *App) void {
+        if (self.history_pos == null) return;
+        if (self.history_pos.? + 1 < self.history.items.len) {
+            self.history_pos.? += 1;
+            const entry = self.history.items[self.history_pos.?];
+            self.editor_view.buffer.clearRetainingCapacity();
+            self.editor_view.buffer.appendSlice(self.allocator, entry) catch {};
+            self.editor_view.cursor = self.editor_view.buffer.items.len;
+        } else {
+            // Restore draft
+            self.history_pos = null;
+            self.editor_view.buffer.clearRetainingCapacity();
+            self.editor_view.buffer.appendSlice(self.allocator, self.history_draft.items) catch {};
+            self.editor_view.cursor = self.editor_view.buffer.items.len;
         }
     }
 
@@ -430,6 +539,11 @@ pub const App = struct {
                 }
             },
             0x06 => try self.openFilePicker(), // Ctrl+F
+            0x12 => { // Ctrl+R — search
+                self.search_query.clearRetainingCapacity();
+                self.mode = .search;
+                self.status_bar.setStatus("Search: type to filter, Enter to jump, ESC to cancel");
+            },
             0x19 => self.copyLastResponse(), // Ctrl+Y
             '\t' => { // Tab — @ completion or pass to editor
                 if (!self.tryAtCompletion()) {
@@ -443,6 +557,13 @@ pub const App = struct {
     fn handleEnter(self: *App) !void {
         const msg = self.editor_view.getText();
         if (msg.len == 0) return;
+
+        // Save to history (skip duplicates of last entry)
+        if (self.history.items.len == 0 or !std.mem.eql(u8, self.history.items[self.history.items.len - 1], msg)) {
+            const saved = self.allocator.dupe(u8, msg) catch null;
+            if (saved) |s| self.history.append(self.allocator, s) catch self.allocator.free(s);
+        }
+        self.history_pos = null;
 
         // Check for slash commands
         if (msg[0] == '/') {
@@ -715,6 +836,13 @@ pub const App = struct {
             self.status_bar.setStatus("Ready");
         }
 
+        // Auto-generate session title after first exchange
+        if (self.session_mgr) |*sm| {
+            if (sm.current_title == null and self.chat_view.messages.items.len >= 2) {
+                self.generateSessionTitle(sm);
+            }
+        }
+
         // Auto-save
         if (self.session_mgr) |*sm| {
             sm.save(&self.chat_view) catch {};
@@ -738,6 +866,11 @@ pub const App = struct {
 
         if (self.mode == .copy_select) {
             self.handleCopyModeInput(input);
+            return;
+        }
+
+        if (self.mode == .search) {
+            self.handleSearchInput(input);
             return;
         }
 
@@ -879,6 +1012,38 @@ pub const App = struct {
         self.chat_view.total_completion_tokens = 0;
         self.status_bar.updateTokens(0, 0);
         self.status_bar.setStatus("Compacted");
+    }
+
+    fn generateSessionTitle(self: *App, sm: *session.SessionManager) void {
+        // Get first user message for title generation
+        var first_user_msg: ?[]const u8 = null;
+        for (self.chat_view.messages.items) |msg| {
+            if (msg.role == .user) {
+                first_user_msg = msg.content;
+                break;
+            }
+        }
+        const user_msg = first_user_msg orelse return;
+        const preview = if (user_msg.len > 200) user_msg[0..200] else user_msg;
+
+        const prompt = std.fmt.allocPrint(self.allocator, "Generate a very short title (3-6 words, no quotes) for this conversation:\n\n{s}", .{preview}) catch return;
+        defer self.allocator.free(prompt);
+
+        const messages = [_]chat.Message{
+            .{ .role = .user, .content = prompt },
+        };
+        const title = http.chatOnce(self.allocator, self.cfg, &messages) catch return;
+
+        // Clean up: trim whitespace and quotes
+        const trimmed = std.mem.trim(u8, title, " \t\n\r\"'");
+        if (trimmed.len == 0 or trimmed.len > 100) {
+            self.allocator.free(title);
+            return;
+        }
+
+        if (sm.current_title) |old| self.allocator.free(old);
+        sm.current_title = self.allocator.dupe(u8, trimmed) catch null;
+        self.allocator.free(title);
     }
 
     fn initProject(self: *App) !void {
@@ -1481,6 +1646,86 @@ pub const App = struct {
             i += 3;
         }
         writeOut("\x07");
+    }
+
+    fn renderSearchBar(self: *App, writer: anytype, t: theme.Theme) !void {
+        // Render search bar at bottom of screen (above status)
+        const row = self.height -| 1;
+        try writer.print("\x1b[{d};1H\x1b[{s}m search: {s}\x1b[7m \x1b[0m\x1b[{s}m\x1b[K\x1b[0m", .{
+            row, t.status_bg, self.search_query.items, t.status_bg,
+        });
+
+        // Highlight matching messages
+        if (self.search_query.items.len > 0) {
+            var match_count: usize = 0;
+            for (self.chat_view.messages.items) |msg| {
+                if (msg.content.len == 0) continue;
+                // Case-insensitive search: just check lowercase
+                if (containsIgnoreCase(msg.content, self.search_query.items)) {
+                    match_count += 1;
+                }
+            }
+            try writer.print(" ({d} matches)", .{match_count});
+        }
+        try writer.writeAll("\x1b[K\x1b[0m");
+    }
+
+    fn handleSearchInput(self: *App, input: []const u8) void {
+        if (input[0] == 27) { // ESC
+            self.mode = .normal;
+            self.status_bar.setStatus("Ready");
+            return;
+        }
+        if (input[0] == '\r' or input[0] == '\n') { // Enter — jump to match
+            if (self.search_query.items.len > 0) {
+                self.jumpToSearchMatch();
+            }
+            self.mode = .normal;
+            self.status_bar.setStatus("Ready");
+            return;
+        }
+        if (input[0] == 127 or input[0] == 8) { // Backspace
+            if (self.search_query.items.len > 0) {
+                _ = self.search_query.pop();
+            }
+            return;
+        }
+        if (input[0] >= 32) { // Printable
+            self.search_query.append(self.allocator, input[0]) catch {};
+        }
+    }
+
+    fn jumpToSearchMatch(self: *App) void {
+        // Find last message matching the query and scroll to it
+        const query = self.search_query.items;
+        if (query.len == 0) return;
+
+        // Count total lines to figure out scroll position
+        var total_lines: usize = 0;
+        var match_line: ?usize = null;
+        for (self.chat_view.messages.items) |msg| {
+            if (msg.role == .assistant and msg.content.len == 0 and msg.tool_calls_json != null) continue;
+
+            // Each message: label + content lines + blank
+            const msg_lines = countContentLines(msg.content) + 2;
+            if (containsIgnoreCase(msg.content, query)) {
+                match_line = total_lines;
+            }
+            total_lines += msg_lines;
+        }
+
+        if (match_line) |ml| {
+            // Set scroll so the matching message is visible
+            const h: usize = @intCast(self.height -| 4);
+            if (total_lines > h and ml < total_lines - h) {
+                self.chat_view.scroll_offset = total_lines - h - ml;
+            } else {
+                self.chat_view.scroll_offset = 0;
+            }
+            self.status_bar.setStatus("Found");
+        } else {
+            self.status_bar.setStatus("Not found");
+        }
     }
 
     fn renderQuitConfirm(writer: anytype, term_width: u16, term_height: u16, t: theme.Theme) !void {
