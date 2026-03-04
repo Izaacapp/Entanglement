@@ -13,6 +13,7 @@ pub const StatusBar = struct {
     is_loading: bool = false,
     spinner_tick: usize = 0,
     scroll_indicator: ?[]const u8 = null, // e.g. "↑ 23 lines"
+    stream_words: usize = 0, // live word count during streaming
 
     pub fn init(cfg: config.Config) StatusBar {
         return .{
@@ -114,7 +115,11 @@ pub const StatusBar = struct {
             try writer.writeAll(spinner_str);
             try writer.writeByte(' ');
         }
-        try writer.print("{s} ", .{self.message});
+        try writer.print("{s}", .{self.message});
+        if (self.is_loading and self.stream_words > 0) {
+            try writer.print(" ({d}w)", .{self.stream_words});
+        }
+        try writer.writeByte(' ');
         try writer.writeAll("\x1b[K\x1b[0m");
     }
 };

@@ -248,6 +248,22 @@ pub const App = struct {
         try layout.renderHLine(w, self.width, t.border);
         try self.editor_view.render(w, self.width, editor_height, t);
 
+        // Update stream word count
+        if (self.streaming and self.chat_view.streaming_active) {
+            var wc: usize = 0;
+            var in_word = false;
+            for (self.chat_view.stream_buf.items) |c| {
+                if (c == ' ' or c == '\n' or c == '\t') {
+                    in_word = false;
+                } else if (!in_word) {
+                    wc += 1;
+                    in_word = true;
+                }
+            }
+            self.status_bar.stream_words = wc;
+            if (wc > 0) self.status_bar.setLoading("Streaming...");
+        }
+
         // Update scroll indicator
         if (self.chat_view.scroll_offset > 0) {
             self.status_bar.scroll_indicator = "\xe2\x86\x91 scrolled";
@@ -645,7 +661,8 @@ pub const App = struct {
         var use_tools = self.tools_supported;
 
         while (iterations < max_iterations) : (iterations += 1) {
-            self.status_bar.setLoading(if (iterations == 0) "Thinking..." else "Using tools...");
+            self.status_bar.setLoading(if (iterations == 0) "Thinking..." else "Tools...");
+            self.status_bar.stream_words = 0;
             try self.render();
 
             self.chat_view.beginAssistantStream();
@@ -931,6 +948,20 @@ pub const App = struct {
             return;
         }
 
+        // 'd' to delete session in session list
+        if (input[0] == 'd' and self.mode == .session_list) {
+            if (self.dialog_view) |*dv| {
+                if (dv.getSelected()) |sel| {
+                    self.deleteSession(sel.value);
+                    // Refresh session list
+                    self.mode = .normal;
+                    self.freeDialogItems();
+                    self.openSessionList() catch {};
+                    return;
+                }
+            }
+        }
+
         if (input[0] == 3 or input[0] == 'q') {
             self.mode = .normal;
             self.freeDialogItems();
@@ -965,6 +996,8 @@ pub const App = struct {
             self.exportChat();
         } else if (std.mem.eql(u8, msg, "/diff")) {
             try self.showGitDiff();
+        } else if (std.mem.startsWith(u8, msg, "/run ")) {
+            try self.runShellCommand(msg[5..]);
         } else {
             self.chat_view.addSystemMessage("Unknown command. Try /help") catch {};
         }
@@ -1072,6 +1105,56 @@ pub const App = struct {
         self.status_bar.setStatus(status_msg);
     }
 
+    fn runShellCommand(self: *App, cmd: []const u8) !void {
+        if (cmd.len == 0) return;
+        try self.chat_view.addSystemMessage(cmd);
+
+        if (self.shell) |*sh| {
+            const result = sh.exec(cmd) catch {
+                try self.chat_view.addSystemMessage("Command failed");
+                return;
+            };
+            defer self.allocator.free(result.content);
+            try self.chat_view.addSystemMessage(result.content);
+        } else {
+            const argv = [_][]const u8{ "/bin/sh", "-c", cmd };
+            var child = std.process.Child.init(&argv, self.allocator);
+            child.stdout_behavior = .Pipe;
+            child.stderr_behavior = .Pipe;
+            child.spawn() catch {
+                try self.chat_view.addSystemMessage("Failed to spawn command");
+                return;
+            };
+
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(self.allocator);
+            var read_buf: [4096]u8 = undefined;
+            if (child.stdout) |pipe| {
+                while (true) {
+                    const n = pipe.read(&read_buf) catch break;
+                    if (n == 0) break;
+                    try out.appendSlice(self.allocator, read_buf[0..n]);
+                    if (out.items.len > 16 * 1024) break;
+                }
+            }
+            if (child.stderr) |pipe| {
+                while (true) {
+                    const n = pipe.read(&read_buf) catch break;
+                    if (n == 0) break;
+                    try out.appendSlice(self.allocator, read_buf[0..n]);
+                    if (out.items.len > 16 * 1024) break;
+                }
+            }
+            _ = child.wait() catch {};
+
+            if (out.items.len == 0) {
+                try self.chat_view.addSystemMessage("[no output]");
+            } else {
+                try self.chat_view.addSystemMessage(out.items);
+            }
+        }
+    }
+
     fn showGitDiff(self: *App) !void {
         const argv = [_][]const u8{ "git", "diff", "--stat", "--no-color" };
         var child = std.process.Child.init(&argv, self.allocator);
@@ -1152,6 +1235,14 @@ pub const App = struct {
             sm.newSession() catch {};
             self.status_bar.setStatus("New session");
         }
+    }
+
+    fn deleteSession(self: *App, id: []const u8) void {
+        const sm = &(self.session_mgr orelse return);
+        var path_buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ sm.session_dir, id }) catch return;
+        std.fs.deleteFileAbsolute(path) catch {};
+        self.status_bar.setStatus("Session deleted");
     }
 
     fn openSessionList(self: *App) !void {

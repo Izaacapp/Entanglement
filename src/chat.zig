@@ -16,6 +16,7 @@ pub const Message = struct {
     tool_name: ?[]const u8 = null, // display name for tool results
     cached_render: ?[]u8 = null, // cached rendered lines (joined with \x00)
     cached_width: u16 = 0, // width at which cache was generated
+    timestamp: i64 = 0, // unix timestamp when message was created
 };
 
 pub const ChatView = struct {
@@ -45,13 +46,13 @@ pub const ChatView = struct {
 
     pub fn addUserMessage(self: *ChatView, text: []const u8) !void {
         const content = try self.allocator.dupe(u8, text);
-        try self.messages.append(self.allocator, .{ .role = .user, .content = content });
+        try self.messages.append(self.allocator, .{ .role = .user, .content = content, .timestamp = std.time.timestamp() });
         self.scrollToBottom();
     }
 
     pub fn addSystemMessage(self: *ChatView, text: []const u8) !void {
         const content = try self.allocator.dupe(u8, text);
-        try self.messages.append(self.allocator, .{ .role = .system, .content = content });
+        try self.messages.append(self.allocator, .{ .role = .system, .content = content, .timestamp = std.time.timestamp() });
         self.scrollToBottom();
     }
 
@@ -112,7 +113,7 @@ pub const ChatView = struct {
         self.streaming_active = false;
         if (self.stream_buf.items.len > 0) {
             const content = try self.stream_buf.toOwnedSlice(self.allocator);
-            try self.messages.append(self.allocator, .{ .role = .assistant, .content = content });
+            try self.messages.append(self.allocator, .{ .role = .assistant, .content = content, .timestamp = std.time.timestamp() });
         }
     }
 
@@ -197,10 +198,26 @@ pub const ChatView = struct {
                 .tool => if (msg.tool_name) |tn| tn else "tool",
             };
 
+            // Format relative time
+            var time_str: []const u8 = "";
+            if (msg.timestamp > 0) {
+                const now = std.time.timestamp();
+                const delta: u64 = @intCast(@max(0, now - msg.timestamp));
+                var time_buf: [24]u8 = undefined;
+                time_str = if (delta < 60)
+                    std.fmt.bufPrint(&time_buf, " \x1b[2m{d}s ago\x1b[0m", .{delta}) catch ""
+                else if (delta < 3600)
+                    std.fmt.bufPrint(&time_buf, " \x1b[2m{d}m ago\x1b[0m", .{delta / 60}) catch ""
+                else if (delta < 86400)
+                    std.fmt.bufPrint(&time_buf, " \x1b[2m{d}h ago\x1b[0m", .{delta / 3600}) catch ""
+                else
+                    std.fmt.bufPrint(&time_buf, " \x1b[2m{d}d ago\x1b[0m", .{delta / 86400}) catch "";
+            }
+
             const label_line = if (is_selected)
                 try std.fmt.allocPrint(frame_alloc, "\x1b[7m\x1b[{s}m {s} \x1b[0m \xe2\x86\x90 copy", .{ label_style, name })
             else
-                try std.fmt.allocPrint(frame_alloc, "\x1b[{s}m {s} \x1b[0m", .{ label_style, name });
+                try std.fmt.allocPrint(frame_alloc, "\x1b[{s}m {s} \x1b[0m{s}", .{ label_style, name, time_str });
             try lines.append(frame_alloc, label_line);
 
             var content = msg.content;
