@@ -8,6 +8,7 @@ pub const Config = struct {
     api_key: ?[]const u8,
     system_prompt: ?[]const u8 = null,
     context_limit: u32 = 32768,
+    models: ?[]const []const u8 = null, // favorite models for quick switching
     owns_strings: bool = false,
     allocator: ?std.mem.Allocator = null,
 
@@ -19,6 +20,10 @@ pub const Config = struct {
                 a.free(self.host);
                 if (self.api_key) |k| a.free(k);
                 if (self.system_prompt) |sp| a.free(sp);
+                if (self.models) |ms| {
+                    for (ms) |m| a.free(m);
+                    a.free(ms);
+                }
             }
         }
     }
@@ -115,6 +120,24 @@ fn loadConfigFile(allocator: std.mem.Allocator, env_map: ?std.StringHashMap([]co
     var ep_buf: [512]u8 = undefined;
     const fixed_ep = fixEndpoint(raw_endpoint, &ep_buf);
 
+    // Parse models array
+    var models_owned: ?[]const []const u8 = null;
+    if (v.models) |ms| {
+        var model_list: std.ArrayList([]const u8) = .empty;
+        for (ms) |m| {
+            const duped = allocator.dupe(u8, m) catch continue;
+            model_list.append(allocator, duped) catch {
+                allocator.free(duped);
+                continue;
+            };
+        }
+        if (model_list.items.len > 0) {
+            models_owned = model_list.toOwnedSlice(allocator) catch null;
+        } else {
+            model_list.deinit(allocator);
+        }
+    }
+
     return Config{
         .endpoint = try allocator.dupe(u8, fixed_ep),
         .model = try allocator.dupe(u8, v.model orelse getEnvOrDotEnv("SNIPER_MODEL", env_map) orelse getEnvOrDotEnv("OLLAMA_MODEL", env_map) orelse default_model),
@@ -122,6 +145,7 @@ fn loadConfigFile(allocator: std.mem.Allocator, env_map: ?std.StringHashMap([]co
         .api_key = if (v.api_key) |k| try allocator.dupe(u8, k) else if (getEnvOrDotEnv("SNIPER_API_KEY", env_map)) |k| try allocator.dupe(u8, k) else null,
         .system_prompt = if (v.system_prompt) |sp| try allocator.dupe(u8, sp) else null,
         .context_limit = v.context_limit orelse 32768,
+        .models = models_owned,
         .owns_strings = true,
         .allocator = allocator,
     };
@@ -167,4 +191,5 @@ const ConfigJson = struct {
     theme: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
     context_limit: ?u32 = null,
+    models: ?[]const []const u8 = null,
 };

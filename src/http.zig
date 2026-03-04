@@ -38,8 +38,23 @@ pub fn streamChat(
     try w.writeAll(cfg.model);
     try w.writeAll("\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
 
-    for (messages, 0..) |msg, idx| {
-        if (idx > 0) try w.writeByte(',');
+    var first_msg = true;
+    // Add system prompt from config as first message
+    if (cfg.system_prompt) |sp| {
+        if (sp.len > 0) {
+            try w.writeAll("{\"role\":\"system\",\"content\":\"");
+            try writeJsonStr(w, sp);
+            try w.writeAll("\"}");
+            first_msg = false;
+        }
+    }
+
+    for (messages) |msg| {
+        // Skip UI-only system messages (errors, command output, etc.)
+        if (msg.role == .system) continue;
+
+        if (!first_msg) try w.writeByte(',');
+        first_msg = false;
         try w.writeAll("{\"role\":\"");
         switch (msg.role) {
             .tool => try w.writeAll("tool"),
@@ -279,6 +294,7 @@ pub fn streamChat(
                         ii += 1;
                     }
                     try chat_view.appendAssistantChunk(unesc.items);
+                    app.status_bar.stream_tokens += 1;
                     const now_ns = std.time.nanoTimestamp();
                     if (now_ns - last_render_ns >= render_interval_ns) {
                         try app.render();

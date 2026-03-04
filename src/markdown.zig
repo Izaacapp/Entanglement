@@ -1,20 +1,49 @@
 const std = @import("std");
 
-/// Strip <think>...</think> blocks from DeepSeek R1 output
+/// Transform <think>...</think> blocks: show dimmed summary instead of stripping
 pub fn stripThinkBlocks(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
     var i: usize = 0;
     while (i < input.len) {
         if (std.mem.startsWith(u8, input[i..], "<think>")) {
-            // Skip until </think>
             if (std.mem.indexOf(u8, input[i..], "</think>")) |end| {
+                // Extract think content, show dimmed summary
+                const think_start = i + "<think>".len;
+                const think_content = input[think_start .. i + end];
+
+                // Count lines in thinking block
+                var line_count: usize = 1;
+                for (think_content) |c| {
+                    if (c == '\n') line_count += 1;
+                }
+
+                // Show collapsed thinking indicator (dim italic)
+                try result.appendSlice(allocator, "\x1b[2;3m\xe2\x96\xb6 thinking (");
+                var line_buf: [16]u8 = undefined;
+                const line_str = std.fmt.bufPrint(&line_buf, "{d}", .{line_count}) catch "?";
+                try result.appendSlice(allocator, line_str);
+                try result.appendSlice(allocator, " lines)\x1b[0m\n");
+
                 i += end + "</think>".len;
-                // Skip leading newline after </think>
                 if (i < input.len and input[i] == '\n') i += 1;
                 continue;
             } else {
-                break; // Still thinking, skip rest
+                // Still thinking — show live indicator
+                const think_start = i + "<think>".len;
+                const think_content = input[think_start..];
+                // Show last line of thinking (dimmed)
+                var last_nl: usize = 0;
+                for (think_content, 0..) |c, ci| {
+                    if (c == '\n') last_nl = ci + 1;
+                }
+                const last_line = think_content[last_nl..];
+                const preview = if (last_line.len > 60) last_line[0..60] else last_line;
+                try result.appendSlice(allocator, "\x1b[2;3m\xe2\x97\x8f thinking: ");
+                try result.appendSlice(allocator, preview);
+                if (last_line.len > 60) try result.appendSlice(allocator, "...");
+                try result.appendSlice(allocator, "\x1b[0m");
+                break;
             }
         }
         try result.append(allocator, input[i]);

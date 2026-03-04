@@ -275,7 +275,10 @@ test "Markdown: stripThinkBlocks" {
     const input = "before<think>thinking stuff</think>after";
     const result = try markdown.stripThinkBlocks(allocator, input);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("beforeafter", result);
+    // Completed think blocks show a collapsed summary instead of being stripped
+    try std.testing.expect(std.mem.indexOf(u8, result, "before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "thinking (") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "after") != null);
 }
 
 test "Markdown: stripThinkBlocks empty" {
@@ -289,7 +292,9 @@ test "Markdown: stripThinkBlocks unclosed" {
     const allocator = std.testing.allocator;
     const result = try markdown.stripThinkBlocks(allocator, "before<think>still thinking...");
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("before", result);
+    // Unclosed think blocks show live thinking indicator
+    try std.testing.expect(std.mem.indexOf(u8, result, "before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "thinking:") != null);
 }
 
 test "Markdown: renderMarkdown bold" {

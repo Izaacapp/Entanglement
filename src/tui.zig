@@ -159,10 +159,7 @@ pub const App = struct {
         // Initialize persistent shell
         app.shell = tools_mod.PersistentShell.init(allocator) catch null;
 
-        // Load system prompt from config
-        if (cfg.system_prompt) |sp| {
-            app.chat_view.addSystemMessage(sp) catch {};
-        }
+        // System prompt is sent via API (http.zig), no need to show in chat
 
         // Load context files
         app.loadContextFiles();
@@ -245,7 +242,25 @@ pub const App = struct {
         const chat_height = self.height -| chrome_height;
 
         try self.chat_view.render(w, self.width, chat_height, t, self.selected_message);
-        try layout.renderHLine(w, self.width, t.border);
+
+        // Separator line with optional attachment indicator
+        if (self.attachments.items.len > 0) {
+            try w.print("\x1b[{s}m", .{t.border});
+            // Show attachment count on the right side of separator
+            var att_buf: [64]u8 = undefined;
+            const att_str = std.fmt.bufPrint(&att_buf, " {d} file{s} attached ", .{
+                self.attachments.items.len,
+                if (self.attachments.items.len > 1) "s" else "",
+            }) catch "";
+            const att_len: u16 = @intCast(att_str.len);
+            const line_len = self.width -| att_len;
+            var li: u16 = 0;
+            while (li < line_len) : (li += 1) try w.writeAll("\xe2\x94\x80");
+            try w.print("\x1b[0m\x1b[33m{s}\x1b[{s}m", .{ att_str, t.border });
+            try w.writeAll("\x1b[0m\x1b[K\r\n");
+        } else {
+            try layout.renderHLine(w, self.width, t.border);
+        }
         try self.editor_view.render(w, self.width, editor_height, t);
 
         // Update stream word count
@@ -596,8 +611,8 @@ pub const App = struct {
                 self.status_bar.setStatus("Search: type to filter, Enter to jump, ESC to cancel");
             },
             0x19 => self.copyLastResponse(), // Ctrl+Y
-            '\t' => { // Tab — @ completion or pass to editor
-                if (!self.tryAtCompletion()) {
+            '\t' => { // Tab — slash/@ completion or pass to editor
+                if (!self.trySlashCompletion() and !self.tryAtCompletion()) {
                     try self.editor_view.handleInput(&[_]u8{c});
                 }
             },
@@ -698,6 +713,8 @@ pub const App = struct {
         while (iterations < max_iterations) : (iterations += 1) {
             self.status_bar.setLoading(if (iterations == 0) "Thinking..." else "Tools...");
             self.status_bar.stream_words = 0;
+            self.status_bar.stream_tokens = 0;
+            self.status_bar.stream_start_ns = std.time.nanoTimestamp();
             try self.render();
 
             self.chat_view.beginAssistantStream();
@@ -737,7 +754,7 @@ pub const App = struct {
                         continue;
                     }
                     self.chat_view.finalizeAssistantStream() catch {};
-                    self.chat_view.addSystemMessage("Error: API request failed") catch {};
+                    self.chat_view.addSystemMessage(self.errorWithHint(err)) catch {};
                     self.status_bar.setStatus("Error");
                     return;
                 };
@@ -758,8 +775,15 @@ pub const App = struct {
                     continue;
                 }
 
-                // Show other API errors to user
-                self.chat_view.addSystemMessage(api_err) catch {};
+                // Show API error with helpful hint
+                const hint = self.apiErrorHint(api_err);
+                if (hint) |h| {
+                    var hint_buf: [512]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&hint_buf, "{s}\n\xe2\x92\xbe {s}", .{ api_err, h }) catch api_err;
+                    self.chat_view.addSystemMessage(msg) catch {};
+                } else {
+                    self.chat_view.addSystemMessage(api_err) catch {};
+                }
                 self.status_bar.setStatus("Error");
                 return;
             }
@@ -1170,6 +1194,32 @@ pub const App = struct {
         try self.chat_view.addSystemMessage(buf.items);
     }
 
+    fn errorWithHint(_: *App, err: anyerror) []const u8 {
+        return switch (err) {
+            error.ConnectionRefused => "Connection refused. Is Ollama running? Try: ollama serve",
+            error.ConnectionResetByPeer => "Connection reset. The server may have crashed or restarted",
+            error.BrokenPipe => "Broken pipe. The API server closed the connection",
+            error.UrlTooLong => "URL too long. Check your endpoint configuration",
+            error.AuthHeaderTooLong => "Auth header too long. Check your API key",
+            error.OutOfMemory => "Out of memory. Try /compact to reduce context size",
+            else => "API request failed. Check endpoint and model in config",
+        };
+    }
+
+    fn apiErrorHint(_: *App, err_msg: []const u8) ?[]const u8 {
+        if (std.mem.indexOf(u8, err_msg, "model") != null and std.mem.indexOf(u8, err_msg, "not found") != null)
+            return "Model not available. Run: ollama pull <model>";
+        if (std.mem.indexOf(u8, err_msg, "401") != null or std.mem.indexOf(u8, err_msg, "unauthorized") != null)
+            return "Check your API key in config.json or SNIPER_API_KEY env var";
+        if (std.mem.indexOf(u8, err_msg, "429") != null or std.mem.indexOf(u8, err_msg, "rate limit") != null)
+            return "Rate limited. Wait a moment and try again";
+        if (std.mem.indexOf(u8, err_msg, "context length") != null or std.mem.indexOf(u8, err_msg, "too long") != null)
+            return "Message too long for model. Try /compact to reduce context";
+        if (std.mem.indexOf(u8, err_msg, "connection") != null)
+            return "Connection error. Is the API server running?";
+        return null;
+    }
+
     fn runShellCommand(self: *App, cmd: []const u8) !void {
         if (cmd.len == 0) return;
         try self.chat_view.addSystemMessage(cmd);
@@ -1331,18 +1381,60 @@ pub const App = struct {
     }
 
     fn openModelSelect(self: *App) !void {
-        const models = self.fetchModels() catch {
-            self.status_bar.setStatus("Failed to fetch models");
-            return;
-        };
-        if (models.len == 0) {
-            self.allocator.free(models);
+        var all_items: std.ArrayList(dialog.DialogItem) = .empty;
+        defer all_items.deinit(self.allocator);
+
+        // Add config favorites first (with ★ prefix)
+        if (self.cfg.models) |favorites| {
+            for (favorites) |m| {
+                const label = std.fmt.allocPrint(self.allocator, "\xe2\x98\x85 {s}", .{m}) catch continue;
+                const value = self.allocator.dupe(u8, m) catch {
+                    self.allocator.free(label);
+                    continue;
+                };
+                all_items.append(self.allocator, .{ .label = label, .value = value }) catch {
+                    self.allocator.free(label);
+                    self.allocator.free(value);
+                };
+            }
+        }
+
+        // Fetch available models from API
+        const fetched = self.fetchModels() catch null;
+        if (fetched) |models| {
+            defer self.allocator.free(models);
+            for (models) |m| {
+                // Skip duplicates (already in favorites)
+                var is_dupe = false;
+                if (self.cfg.models) |favorites| {
+                    for (favorites) |fav| {
+                        if (std.mem.eql(u8, m.value, fav)) {
+                            is_dupe = true;
+                            break;
+                        }
+                    }
+                }
+                if (is_dupe) {
+                    self.allocator.free(m.label);
+                    self.allocator.free(m.value);
+                    continue;
+                }
+                all_items.append(self.allocator, m) catch {
+                    self.allocator.free(m.label);
+                    self.allocator.free(m.value);
+                };
+            }
+        }
+
+        if (all_items.items.len == 0) {
             self.status_bar.setStatus("No models found");
             return;
         }
+
         self.freeDialogItems();
-        self.dialog_items = models;
-        self.dialog_view = dialog.Dialog.init(self.allocator, "Select Model", models);
+        const items = try all_items.toOwnedSlice(self.allocator);
+        self.dialog_items = items;
+        self.dialog_view = dialog.Dialog.init(self.allocator, "Select Model", items);
         self.dialog_view.?.visible = true;
         self.mode = .model_select;
     }
@@ -1457,23 +1549,117 @@ pub const App = struct {
             "OpenCode.md",
             "OpenCode.local.md",
             "OPENCODE.md",
+            ".sniper.md",
             ".cursorrules",
             ".github/copilot-instructions.md",
         };
 
         var context: std.ArrayList(u8) = .empty;
         defer context.deinit(self.allocator);
-        const w = context.writer(self.allocator);
+        const cw = context.writer(self.allocator);
 
+        // Include existing system prompt first
+        if (self.cfg.system_prompt) |sp| {
+            cw.print("{s}\n\n", .{sp}) catch {};
+        }
+
+        var found_files: usize = 0;
         for (context_files) |path| {
             const content = std.fs.cwd().readFileAlloc(self.allocator, path, 64 * 1024) catch continue;
             defer self.allocator.free(content);
-            w.print("# Context from {s}:\n{s}\n\n", .{ path, content }) catch continue;
+            cw.print("# Context from {s}:\n{s}\n\n", .{ path, content }) catch continue;
+            found_files += 1;
         }
 
         if (context.items.len > 0) {
-            self.chat_view.addSystemMessage(context.items) catch {};
+            // Replace system_prompt with combined prompt (config + context files)
+            const combined = self.allocator.dupe(u8, context.items) catch return;
+            // Free old system_prompt if we own it
+            if (self.cfg.owns_strings) {
+                if (self.cfg.system_prompt) |sp| self.allocator.free(sp);
+            }
+            self.cfg.system_prompt = combined;
+            self.cfg.owns_strings = true; // We now own the system_prompt string
+            if (found_files > 0) {
+                var status_buf: [64]u8 = undefined;
+                const status_msg = std.fmt.bufPrint(&status_buf, "Loaded {d} context file{s}", .{
+                    found_files,
+                    if (found_files > 1) "s" else "",
+                }) catch "Context loaded";
+                self.status_bar.setStatus(status_msg);
+            }
         }
+    }
+
+    fn trySlashCompletion(self: *App) bool {
+        const buf = self.editor_view.buffer.items;
+        if (buf.len == 0 or buf[0] != '/') return false;
+        // Only complete if cursor is at end and no spaces
+        if (self.editor_view.cursor != buf.len) return false;
+        for (buf) |c| {
+            if (c == ' ') return false;
+        }
+
+        const commands = [_][]const u8{
+            "/new",     "/quit",    "/clear",   "/help",
+            "/theme",   "/model",   "/sessions", "/compact",
+            "/copy",    "/export",  "/diff",    "/run",
+            "/status",  "/init",
+        };
+
+        const prefix = buf;
+        var match: ?[]const u8 = null;
+        var match_count: usize = 0;
+        for (commands) |cmd| {
+            if (cmd.len >= prefix.len and std.mem.startsWith(u8, cmd, prefix)) {
+                if (match == null) match = cmd;
+                match_count += 1;
+            }
+        }
+
+        if (match_count == 1) {
+            // Unique match — complete it
+            const m = match.?;
+            // Clear buffer and insert completed command
+            self.editor_view.buffer.clearRetainingCapacity();
+            self.editor_view.cursor = 0;
+            for (m) |c| {
+                self.editor_view.buffer.append(self.allocator, c) catch return false;
+                self.editor_view.cursor += 1;
+            }
+            return true;
+        } else if (match_count > 1) {
+            // Multiple matches — complete common prefix
+            var common_len = prefix.len;
+            outer: while (common_len < 20) : (common_len += 1) {
+                var ref_char: ?u8 = null;
+                for (commands) |cmd| {
+                    if (cmd.len >= prefix.len and std.mem.startsWith(u8, cmd, prefix)) {
+                        if (common_len >= cmd.len) {
+                            break :outer;
+                        }
+                        if (ref_char == null) {
+                            ref_char = cmd[common_len];
+                        } else if (cmd[common_len] != ref_char.?) {
+                            break :outer;
+                        }
+                    }
+                }
+                // All matching commands agree on this char
+            }
+            if (common_len > prefix.len) {
+                // Extend to common prefix
+                const m = match.?;
+                self.editor_view.buffer.clearRetainingCapacity();
+                self.editor_view.cursor = 0;
+                for (m[0..common_len]) |c| {
+                    self.editor_view.buffer.append(self.allocator, c) catch return false;
+                    self.editor_view.cursor += 1;
+                }
+                return true;
+            }
+        }
+        return false;
     }
 
     fn tryAtCompletion(self: *App) bool {

@@ -14,6 +14,8 @@ pub const StatusBar = struct {
     spinner_tick: usize = 0,
     scroll_indicator: ?[]const u8 = null, // e.g. "↑ 23 lines"
     stream_words: usize = 0, // live word count during streaming
+    stream_start_ns: i128 = 0, // nanoTimestamp when streaming began
+    stream_tokens: usize = 0, // token count during current stream
 
     pub fn init(cfg: config.Config) StatusBar {
         return .{
@@ -117,7 +119,22 @@ pub const StatusBar = struct {
         }
         try writer.print("{s}", .{self.message});
         if (self.is_loading and self.stream_words > 0) {
-            try writer.print(" ({d}w)", .{self.stream_words});
+            // Show word count + tokens/sec
+            if (self.stream_tokens > 0 and self.stream_start_ns > 0) {
+                const now = std.time.nanoTimestamp();
+                const elapsed_ns = now - self.stream_start_ns;
+                if (elapsed_ns > 500_000_000) { // only show after 0.5s
+                    const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+                    const tps = @as(f64, @floatFromInt(self.stream_tokens)) / elapsed_s;
+                    var tps_buf: [32]u8 = undefined;
+                    const tps_str = std.fmt.bufPrint(&tps_buf, " ({d}w {d:.0}t/s)", .{ self.stream_words, tps }) catch "";
+                    try writer.writeAll(tps_str);
+                } else {
+                    try writer.print(" ({d}w)", .{self.stream_words});
+                }
+            } else {
+                try writer.print(" ({d}w)", .{self.stream_words});
+            }
         }
         try writer.writeByte(' ');
         try writer.writeAll("\x1b[K\x1b[0m");
