@@ -1,0 +1,12 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# Environment
+.env
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
