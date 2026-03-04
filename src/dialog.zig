@@ -152,7 +152,7 @@ pub fn renderHelp(writer: anytype, term_width: u16, term_height: u16, t: theme.T
         "Slash commands:",
         "/new /clear /help /quit /copy",
         "/theme /model /sessions /init",
-        "/compact",
+        "/compact /export /diff",
         "",
         "Press ESC to close",
     };

@@ -961,6 +961,10 @@ pub const App = struct {
             try self.compactContext();
         } else if (std.mem.eql(u8, msg, "/copy")) {
             self.enterCopyMode();
+        } else if (std.mem.eql(u8, msg, "/export")) {
+            self.exportChat();
+        } else if (std.mem.eql(u8, msg, "/diff")) {
+            try self.showGitDiff();
         } else {
             self.chat_view.addSystemMessage("Unknown command. Try /help") catch {};
         }
@@ -1012,6 +1016,90 @@ pub const App = struct {
         self.chat_view.total_completion_tokens = 0;
         self.status_bar.updateTokens(0, 0);
         self.status_bar.setStatus("Compacted");
+    }
+
+    fn exportChat(self: *App) void {
+        if (self.chat_view.messages.items.len == 0) {
+            self.status_bar.setStatus("Nothing to export");
+            return;
+        }
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const w = buf.writer(self.allocator);
+
+        w.writeAll("# Chat Export\n\n") catch return;
+
+        for (self.chat_view.messages.items) |msg| {
+            if (msg.role == .assistant and msg.content.len == 0 and msg.tool_calls_json != null) continue;
+
+            const header: []const u8 = switch (msg.role) {
+                .user => "## You\n\n",
+                .assistant => "## Sniper\n\n",
+                .system => "## System\n\n",
+                .tool => "## Tool Result\n\n",
+            };
+            w.writeAll(header) catch continue;
+
+            // Strip think blocks for assistant messages
+            if (msg.role == .assistant) {
+                const stripped = markdown.stripThinkBlocks(self.allocator, msg.content) catch msg.content;
+                defer if (stripped.ptr != msg.content.ptr) self.allocator.free(stripped);
+                w.writeAll(stripped) catch continue;
+            } else {
+                w.writeAll(msg.content) catch continue;
+            }
+            w.writeAll("\n\n---\n\n") catch continue;
+        }
+
+        // Write to file
+        const ts = std.time.timestamp();
+        var path_buf: [128]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "sniper_export_{d}.md", .{@as(u64, @intCast(ts))}) catch return;
+
+        const file = std.fs.cwd().createFile(path, .{}) catch {
+            self.status_bar.setStatus("Export failed");
+            return;
+        };
+        defer file.close();
+        file.writeAll(buf.items) catch {
+            self.status_bar.setStatus("Write failed");
+            return;
+        };
+
+        var status_buf: [64]u8 = undefined;
+        const status_msg = std.fmt.bufPrint(&status_buf, "Exported to {s}", .{path}) catch "Exported!";
+        self.status_bar.setStatus(status_msg);
+    }
+
+    fn showGitDiff(self: *App) !void {
+        const argv = [_][]const u8{ "git", "diff", "--stat", "--no-color" };
+        var child = std.process.Child.init(&argv, self.allocator);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        child.spawn() catch {
+            try self.chat_view.addSystemMessage("Not a git repository");
+            return;
+        };
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        var read_buf: [4096]u8 = undefined;
+        if (child.stdout) |pipe| {
+            while (true) {
+                const n = pipe.read(&read_buf) catch break;
+                if (n == 0) break;
+                try out.appendSlice(self.allocator, read_buf[0..n]);
+                if (out.items.len > 16 * 1024) break;
+            }
+        }
+        _ = child.wait() catch {};
+
+        if (out.items.len == 0) {
+            try self.chat_view.addSystemMessage("No changes (working tree clean)");
+        } else {
+            try self.chat_view.addSystemMessage(out.items);
+        }
     }
 
     fn generateSessionTitle(self: *App, sm: *session.SessionManager) void {

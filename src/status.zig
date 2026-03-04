@@ -47,14 +47,44 @@ pub const StatusBar = struct {
 
         // Token count + context % if available
         if (self.prompt_tokens > 0 or self.completion_tokens > 0) {
-            var tok_buf: [96]u8 = undefined;
+            var tok_buf: [128]u8 = undefined;
             const ctx_pct = if (self.context_limit > 0)
                 (self.prompt_tokens * 100) / self.context_limit
             else
                 0;
-            const tok_str = std.fmt.bufPrint(&tok_buf, " | in:{d} out:{d} | ctx:{d}%", .{ self.prompt_tokens, self.completion_tokens, ctx_pct }) catch "";
+            // Visual progress bar: [████░░░░] XX%
+            const bar_width: usize = 8;
+            const filled = (ctx_pct * bar_width) / 100;
+            var bar: [8]u8 = undefined;
+            for (0..bar_width) |bi| {
+                bar[bi] = if (bi < filled) 0xDB else 0xB0; // filled vs empty
+            }
+            // Use unicode block chars for better look
+            var bar_buf: [32]u8 = undefined;
+            var bar_pos: usize = 0;
+            for (0..bar_width) |bi| {
+                if (bi < filled) {
+                    // Full block: U+2588 = E2 96 88
+                    bar_buf[bar_pos] = 0xE2;
+                    bar_buf[bar_pos + 1] = 0x96;
+                    bar_buf[bar_pos + 2] = 0x88;
+                    bar_pos += 3;
+                } else {
+                    // Light shade: U+2591 = E2 96 91
+                    bar_buf[bar_pos] = 0xE2;
+                    bar_buf[bar_pos + 1] = 0x96;
+                    bar_buf[bar_pos + 2] = 0x91;
+                    bar_pos += 3;
+                }
+            }
+            const tok_str = std.fmt.bufPrint(&tok_buf, " | {d}+{d}tok [{s}] {d}%", .{
+                self.prompt_tokens,
+                self.completion_tokens,
+                bar_buf[0..bar_pos],
+                ctx_pct,
+            }) catch "";
             try writer.writeAll(tok_str);
-            left_len += tok_str.len;
+            left_len += tok_str.len - (bar_pos - bar_width); // ANSI-aware: unicode chars are 3 bytes but 1 column
         }
 
         // Scroll indicator

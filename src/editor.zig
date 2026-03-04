@@ -273,7 +273,8 @@ pub const Editor = struct {
 
             if (line_idx >= self.scroll_offset and lines_rendered < max_lines) {
                 const line_content = self.buffer.items[pos..end];
-                const prefix = if (line_idx == 0) " > " else "   ";
+                const is_multiline = self.getLineCount() > 1;
+                const prefix = if (!is_multiline) " > " else if (line_idx == 0) " > " else "   ";
                 try writer.print("\x1b[{s}m{s}\x1b[0m", .{ t.prompt_style, prefix });
 
                 // Show visible portion with cursor
