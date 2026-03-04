@@ -158,6 +158,8 @@ pub fn streamChat(
 
     // Track whether we received any SSE data
     var got_sse_data = false;
+    // Track reasoning state for <think> wrapping
+    var in_reasoning = false;
     // Accumulate all raw bytes for error detection
     var raw_response: std.ArrayList(u8) = .empty;
     defer raw_response.deinit(allocator);
@@ -206,6 +208,12 @@ pub fn streamChat(
                 got_sse_data = true;
                 const data = line["data: ".len..];
                 if (std.mem.eql(u8, data, "[DONE]")) {
+                    // Close reasoning tag if still open
+                    if (in_reasoning) {
+                        try chat_view.appendAssistantChunk("</think>");
+                        in_reasoning = false;
+                    }
+
                     // Final render before returning
                     app.render() catch {};
 
@@ -253,8 +261,15 @@ pub fn streamChat(
                     parseToolCallDelta(allocator, data, &tc_ids, &tc_names, &tc_args) catch {};
                 }
 
+                // Extract reasoning (deepseek-r1 thinking) or content
+                const reasoning = extractJsonField(data, "reasoning");
                 const content = extractContent(data);
-                if (content) |c| {
+
+                // Pick whichever has actual content
+                const chunk_raw = if (content) |c| (if (c.len > 0) c else reasoning) else reasoning;
+                const is_reasoning = chunk_raw != null and (content == null or content.?.len == 0);
+
+                if (chunk_raw) |c| {
                     if (c.len == 0) {
                         const after = nl + 1;
                         std.mem.copyForwards(u8, remainder.items[0..], remainder.items[after..]);
@@ -263,6 +278,16 @@ pub fn streamChat(
                     }
                     var unesc: std.ArrayList(u8) = .empty;
                     defer unesc.deinit(allocator);
+
+                    // Wrap reasoning in <think> tags for display
+                    if (is_reasoning and !in_reasoning) {
+                        try unesc.appendSlice(allocator, "<think>");
+                        in_reasoning = true;
+                    } else if (!is_reasoning and in_reasoning) {
+                        try unesc.appendSlice(allocator, "</think>");
+                        in_reasoning = false;
+                    }
+
                     var ii: usize = 0;
                     while (ii < c.len) {
                         if (ii + 1 < c.len and c[ii] == '\\') {
@@ -446,7 +471,12 @@ fn parseToolCallDelta(
 }
 
 fn extractContent(json: []const u8) ?[]const u8 {
-    const needle = "\"content\":\"";
+    return extractJsonField(json, "content");
+}
+
+fn extractJsonField(json: []const u8, key: []const u8) ?[]const u8 {
+    var needle_buf: [128]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":\"", .{key}) catch return null;
     const start = std.mem.indexOf(u8, json, needle) orelse return null;
     const content_start = start + needle.len;
 
